@@ -1,0 +1,44 @@
+name: GA107 experimental source build (do not flash)
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout upstream fork
+        uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate patch fixture
+        shell: pwsh
+        run: python ga107/validate_patch.py
+      - name: Apply experimental GA107 patch
+        shell: pwsh
+        run: python ga107/apply_ga107_patch.py .
+      - name: Install Rust stable with UEFI target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+      - name: Build upstream project
+        shell: pwsh
+        run: |
+          cargo build --release
+          cargo efi-tx
+      - name: Check output format (not hardware validation)
+        shell: pwsh
+        run: |
+          $p = 'target/x86_64-unknown-uefi/release/loader.efi'
+          if (!(Test-Path $p)) { throw 'loader.efi not generated' }
+          $b = [IO.File]::ReadAllBytes((Resolve-Path $p))
+          if ($b.Length -lt 512 -or $b[0] -ne 77 -or $b[1] -ne 90) { throw 'Invalid PE header' }
+          (Get-FileHash $p -Algorithm SHA256) | Format-List
+      - name: Upload compile artifact (UNTESTED)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GA107-UNTESTED-loader-DO-NOT-FLASH
+          path: target/x86_64-unknown-uefi/release/loader.efi
