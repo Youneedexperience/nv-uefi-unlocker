@@ -27,7 +27,7 @@ def transform_booter(s):
         raise RuntimeError(f'PLM polling reads expected 2, found {region.count(old)}')
     return s[:start] + region.replace(old, 'plm_addr as u64') + s[end:]
 
-INSERT = r'''    // GA107 RECONFIG proof-of-concept: second signed-booter SEC2 fire.
+INSERT = r'''    // GA107 RECONFIG second SEC2 fire: explicit opt-in, no TPC override writes.
     // Explicitly opt-in by marker; no effects on the upstream default path.
     if booter_ok && payload_mode && assets.family == "ga102"
         && probe_file("\\tx-ga107-reconfig.txt")
@@ -53,6 +53,13 @@ INSERT = r'''    // GA107 RECONFIG proof-of-concept: second signed-booter SEC2 f
                 // Stage 1 already unlocked FEAT/Tensor. Retarget the DMA
                 // signature for a second SEC2 execution in the SAME boot.
                 let sig = unsafe { core::slice::from_raw_parts_mut(sig_dma.host, tb::V67_SIZE) };
+                // Confirm the *live DMA buffer* has the expected original payload.
+                // Do not trust an immutable source check alone.
+                let live_before = u32::from_le_bytes(sig[ADDR_OFF..ADDR_OFF + 4].try_into().unwrap());
+                if live_before != regs::FEAT_PLM {
+                    info!("GA107-RC: ABORT live signature differs from expected FEAT target: {live_before:#010x}");
+                    return Err(TxError::EInval);
+                }
                 sig[ADDR_OFF..ADDR_OFF + 4].copy_from_slice(&0x0082_00d8u32.to_le_bytes());
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 info!("GA107-RC: second SEC2 fire targeting 0x8200d8");
@@ -60,25 +67,44 @@ INSERT = r'''    // GA107 RECONFIG proof-of-concept: second signed-booter SEC2 f
                     false, tb::BooterWait::PlmFlipAt(0x0082_00d8));
                 sig[ADDR_OFF..ADDR_OFF + 4].copy_from_slice(&regs::FEAT_PLM.to_le_bytes());
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                let restored = u32::from_le_bytes(sig[ADDR_OFF..ADDR_OFF + 4].try_into().unwrap());
+                if restored != regs::FEAT_PLM {
+                    info!("GA107-RC: ERROR payload restoration check failed: {restored:#010x}");
+                    return Err(TxError::EIO);
+                }
                 let now = gpu.read32_raw(0x0082_00d8);
-                info!("GA107-RC: second booter result={secondary:?}, RECONFIG_PLM={now:#010x}");
+                info!("GA107-RC: second booter result={secondary:?}, RECONFIG_PLM={now:#010x}; original payload restored");
                 if secondary.is_ok() && now == 0xffff_ffff {
-                    // CMP170HX uses 0xff. The GA107 bit-mask semantics are
-                    // UNVERIFIED. Limit this to bit0 on the two actual GPCs.
-                    for g in 0..2u32 {
-                        let reg = 0x0082_0a40 + 4 * g;
-                        let stat = 0x0082_0c38 + 4 * g;
-                        let old = gpu.read32_raw(reg);
-                        let pre = gpu.read32_raw(stat);
-                        if old != 0 || pre != 0x21 { continue; }
-                        gpu.write32(reg, 1);
-                        let rb = gpu.read32_raw(reg);
-                        let post = gpu.read32_raw(stat);
-                        info!("GA107-RC: GPC{g} override=1 readback={rb:#x} STATUS {pre:#x}->{post:#x}");
-                        if post & 1 != 0 || (post & !1) != (pre & !1) {
-                            gpu.write32(reg, old);
-                            info!("GA107-RC: GPC{g} no isolated TPC0 improvement; restore readback={:#x}", gpu.read32_raw(reg));
+                    // GA107 EXPERIMENT. RECONFIG OVR bits are NOT validated on GA107.
+                    // A separate explicit opt-in marker is required for any write.
+                    if probe_file("\\tx-ga107-tpc-write.txt") {
+                        info!("GA107-RC: WRITE EXPERIMENT OPTED IN; attempting one TPC0 bit at a time");
+                        for g in 0..2u32 {
+                            let reg = 0x0082_0a40 + 4 * g;
+                            let stat = 0x0082_0c38 + 4 * g;
+                            let before = gpu.read32_raw(reg);
+                            let status_before = gpu.read32_raw(stat);
+                            if before != 0 || status_before != 0x21 {
+                                info!("GA107-RC: GPC{g} baseline mismatch; skipping write");
+                                continue;
+                            }
+                            gpu.write32(reg, 1);
+                            let readback = gpu.read32_raw(reg);
+                            let status_after = gpu.read32_raw(stat);
+                            info!("GA107-RC: GPC{g} EXPERIMENT reg={readback:#010x}, STATUS {status_before:#010x}->{status_after:#010x}");
+                            // Always undo this probe. A changed mask is NOT evidence
+                            // of a functional SM, and must not persist by accident.
+                            gpu.write32(reg, before);
+                            let restored = gpu.read32_raw(reg);
+                            let status_restored = gpu.read32_raw(stat);
+                            info!("GA107-RC: GPC{g} RESTORE reg={restored:#010x} STATUS={status_restored:#010x}");
+                            if restored != before || status_restored != status_before {
+                                info!("GA107-RC: RESTORE MISMATCH; stopping all experiments");
+                                return Err(TxError::EIO);
+                            }
                         }
+                    } else {
+                        info!("GA107-RC: RECONFIG gate open; no write marker — no TPC modifications");
                     }
                 } else {
                     info!("GA107-RC: protected gate did not open — no override writes");
