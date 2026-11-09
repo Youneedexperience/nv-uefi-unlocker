@@ -24,3 +24,11 @@ with tempfile.TemporaryDirectory() as d:
   raise AssertionError('Patch must refuse already modified source')
  print('PASS: source transformations work on minimal anchor fixtures')
  print('WARN: this does not prove compatibility with upstream, Rust compilation, or GA107 hardware')
+
+assert 'WRITE EXPERIMENT OPTED IN' in patched_tx
+assert 'live signature differs' in patched_tx
+assert 'original payload restored' in patched_tx
+assert 'gpu.write32(reg, 1)' in patched_tx
+assert 'gpu.write32(reg, before)' in patched_tx
+assert 'RESTORE MISMATCH' in patched_tx
+print('PASS: live DMA guard, payload restoration check, and explicit opt-in guarded override write/restore')
