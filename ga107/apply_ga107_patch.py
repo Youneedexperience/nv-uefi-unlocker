@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline experimental patch for upstream nv-uefi-unlocker; not a tested unlock."""
+"""GA107 v0.11 experimental persistent RECONFIG override; untested on hardware."""
 import argparse
 from pathlib import Path
 
@@ -45,9 +45,11 @@ INSERT = r'''    // GA107 RECONFIG second SEC2 fire: explicit opt-in, no TPC ove
             info!("GA107-RC: ABORT second stage (baseline/identity/staging mismatch)");
         } else if let Some(v67_original) = assets.v67.as_ref() {
             const ADDR_OFF: usize = 0xf960;
-            // Parent loader validated the payload length earlier.
-            let orig = u32::from_le_bytes(v67_original[ADDR_OFF..ADDR_OFF + 4].try_into().unwrap());
-            if v67_original.len() != tb::V67_SIZE || orig != regs::FEAT_PLM {
+            // Check bounds before indexing the firmware payload.
+            let orig = v67_original.get(ADDR_OFF..ADDR_OFF + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes);
+            if v67_original.len() != tb::V67_SIZE || orig != Some(regs::FEAT_PLM) {
                 info!("GA107-RC: ABORT unrecognized payload");
             } else {
                 // Stage 1 already unlocked FEAT/Tensor. Retarget the DMA
@@ -75,33 +77,52 @@ INSERT = r'''    // GA107 RECONFIG second SEC2 fire: explicit opt-in, no TPC ove
                 let now = gpu.read32_raw(0x0082_00d8);
                 info!("GA107-RC: second booter result={secondary:?}, RECONFIG_PLM={now:#010x}; original payload restored");
                 if secondary.is_ok() && now == 0xffff_ffff {
-                    // GA107 EXPERIMENT. RECONFIG OVR bits are NOT validated on GA107.
-                    // A separate explicit opt-in marker is required for any write.
+                    // GA107 EXPERIMENT: a successful register write is NOT proof of
+                    // activating a previously fused-off SM. This mode explicitly
+                    // leaves accepted RECONFIG bits set until the normal FLR,
+                    // where we log whether the mask survived.
                     if probe_file("\\tx-ga107-tpc-write.txt") {
-                        info!("GA107-RC: WRITE EXPERIMENT OPTED IN; attempting one TPC0 bit at a time");
-                        for g in 0..2u32 {
-                            let reg = 0x0082_0a40 + 4 * g;
-                            let stat = 0x0082_0c38 + 4 * g;
+                        info!("GA107-RC: PERSISTENT WRITE EXPERIMENT OPTED IN (GA107 unknown semantics)");
+                        let mut changed: [bool; 2] = [false, false];
+                        let mut rollback_required = false;
+                        for g in 0..2usize {
+                            let reg = 0x0082_0a40 + 4 * g as u32;
+                            let stat = 0x0082_0c38 + 4 * g as u32;
                             let before = gpu.read32_raw(reg);
                             let status_before = gpu.read32_raw(stat);
                             if before != 0 || status_before != 0x21 {
-                                info!("GA107-RC: GPC{g} baseline mismatch; skipping write");
-                                continue;
+                                info!("GA107-RC: GPC{g} baseline unexpected: ovr={before:#x} status={status_before:#x}; rollback");
+                                rollback_required = true;
+                                break;
                             }
-                            gpu.write32(reg, 1);
+                            // Target ONLY the observed TPC0 candidate; do not
+                            // use GA100's all-TPC 0xFF mask on GA107.
+                            gpu.write32(reg, 0x01);
                             let readback = gpu.read32_raw(reg);
                             let status_after = gpu.read32_raw(stat);
-                            info!("GA107-RC: GPC{g} EXPERIMENT reg={readback:#010x}, STATUS {status_before:#010x}->{status_after:#010x}");
-                            // Always undo this probe. A changed mask is NOT evidence
-                            // of a functional SM, and must not persist by accident.
-                            gpu.write32(reg, before);
-                            let restored = gpu.read32_raw(reg);
-                            let status_restored = gpu.read32_raw(stat);
-                            info!("GA107-RC: GPC{g} RESTORE reg={restored:#010x} STATUS={status_restored:#010x}");
-                            if restored != before || status_restored != status_before {
-                                info!("GA107-RC: RESTORE MISMATCH; stopping all experiments");
-                                return Err(TxError::EIO);
+                            info!("GA107-RC: GPC{g} write=0x01 OVR={readback:#010x} STATUS {status_before:#010x}->{status_after:#010x}");
+                            if readback != 0x01 || status_after == 0xffff_ffff
+                                || (status_after & 0xffff_0000) == 0xbadf_0000
+                            {
+                                info!("GA107-RC: GPC{g} REJECTED/POISON; rollback requested");
+                                rollback_required = true;
+                                break;
                             }
+                            changed[g] = true;
+                        }
+                        if rollback_required {
+                            for g in 0..2usize {
+                                let reg = 0x0082_0a40 + 4 * g as u32;
+                                // The failing write may partially stick, so
+                                // restore both known-baseline registers.
+                                gpu.write32(reg, 0);
+                                let rb = gpu.read32_raw(reg);
+                                info!("GA107-RC: rollback GPC{g} OVR={rb:#010x}");
+                                if rb != 0 { return Err(TxError::EIO); }
+                            }
+                            info!("GA107-RC: no TPC override intentionally retained");
+                        } else if changed[0] && changed[1] {
+                            info!("GA107-RC: GPC0/GPC1 OVR accepted and intentionally retained until FLR; NOT an SM unlock verdict");
                         }
                     } else {
                         info!("GA107-RC: RECONFIG gate open; no write marker — no TPC modifications");
@@ -126,7 +147,9 @@ def transform_tx(s):
         {
             let a = gpu.read32_raw(0x0082_0c38);
             let b = gpu.read32_raw(0x0082_0c3c);
-            info!("GA107-RC: POST-FLR GPC0 STATUS={a:#x} GPC1 STATUS={b:#x}; still requires Windows SM-count confirmation");
+            let ov0 = gpu.read32_raw(0x0082_0a40);
+            let ov1 = gpu.read32_raw(0x0082_0a44);
+            info!("GA107-RC: POST-FLR STATUS0/1={a:#x}/{b:#x} OVR0/1={ov0:#x}/{ov1:#x}; Windows SM-count confirmation required");
         }
     """
     return one(s, anchor, anchor + post, 'post-FLR readback')

@@ -28,7 +28,11 @@ with tempfile.TemporaryDirectory() as d:
 assert 'WRITE EXPERIMENT OPTED IN' in patched_tx
 assert 'live signature differs' in patched_tx
 assert 'original payload restored' in patched_tx
-assert 'gpu.write32(reg, 1)' in patched_tx
-assert 'gpu.write32(reg, before)' in patched_tx
-assert 'RESTORE MISMATCH' in patched_tx
-print('PASS: live DMA guard, payload restoration check, and explicit opt-in guarded override write/restore')
+assert 'gpu.write32(reg, 0x01)' in patched_tx
+assert 'intentionally retained until FLR' in patched_tx
+assert 'rollback_required' in patched_tx
+print('PASS: live DMA guard, payload restore, explicit opt-in, guarded retained write and rollback')
+assert 'gpu.write32(reg, before)' not in patched_tx
+assert 'GA107-RC: POST-FLR STATUS0/1=' in patched_tx
+assert 'Some(regs::FEAT_PLM)' in patched_tx
+print('PASS: persistent write is gated; no unconditional restore; post-FLR readback added')
